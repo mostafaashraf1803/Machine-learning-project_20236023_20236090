@@ -1,1 +1,198 @@
 
+import cv2
+import numpy as np
+import joblib
+import torch
+import torchvision.transforms as transforms
+from torchvision import models
+import torch.nn as nn
+from PIL import Image
+from skimage.feature import hog, local_binary_pattern
+
+# ── Load models ──
+scaler = joblib.load('scaler.pkl')
+pca    = joblib.load('pca.pkl')
+svm    = joblib.load('svm_classifier.pkl')
+
+CLASS_NAMES = ['glass', 'paper', 'cardboard', 'plastic', 'metal', 'trash']
+CONFIDENCE_THRESHOLD = 0.60
+
+CLASS_COLORS = {
+    'glass':     (255, 200,   0),
+    'paper':     (  0, 255, 150),
+    'cardboard': (  0, 165, 255),
+    'plastic':   (255,   0, 200),
+    'metal':     (180, 180, 180),
+    'trash':     (  0,   0, 255),
+    'unknown':   ( 80,  80,  80),
+}
+
+# ── Feature extractor (must match exactly what you used in Colab) ──
+class DeepFeatureExtractor:
+    def __init__(self, device=None):
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        base = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
+        self.layer_names = {
+            'early': base.features[2],
+            'mid':   base.features[5],
+            'late':  base.features[8],
+        }
+        self.backbone = base.features.to(self.device).eval()
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self._feature_maps = {}
+        for name, layer in self.layer_names.items():
+            layer.register_forward_hook(self._make_hook(name))
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406],
+                                 [0.229, 0.224, 0.225]),
+        ])
+
+    def _make_hook(self, name):
+        def hook(module, input, output):
+            pooled = self.pool(output).squeeze(-1).squeeze(-1)
+            self._feature_maps[name] = pooled.detach().cpu().numpy()
+        return hook
+
+    def extract(self, img_bgr):
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        tensor  = self.transform(Image.fromarray(img_rgb)).unsqueeze(0).to(self.device)
+        self._feature_maps.clear()
+        with torch.no_grad():
+            self.backbone(tensor)
+        return np.concatenate([
+            self._feature_maps['early'].flatten(),
+            self._feature_maps['mid'].flatten(),
+            self._feature_maps['late'].flatten(),
+        ])
+
+def get_hog_features(img):
+    img  = cv2.resize(img, (128, 128))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray  = clahe.apply(gray)
+    return hog(gray, orientations=12, pixels_per_cell=(8,8),
+               cells_per_block=(3,3), block_norm='L2-Hys', feature_vector=True)
+
+def get_color_histogram(img):
+    img = cv2.resize(img, (128, 128))
+    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    features = []
+    for i in range(3):
+        hist = cv2.calcHist([img_hsv], [i], None, [32], [0, 256])
+        features.extend(hist.flatten())
+    for i in range(3):
+        hist = cv2.calcHist([img], [i], None, [32], [0, 256])
+        features.extend(hist.flatten())
+    return np.array(features, dtype=np.float32)
+
+def get_lbp_features(img):
+    img  = cv2.resize(img, (128, 128))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    feats = []
+    for radius in [1, 3, 5]:
+        n_points = 8 * radius
+        lbp  = local_binary_pattern(gray, P=n_points, R=radius, method='uniform')
+        n_bins = n_points + 2
+        hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
+        hist = hist.astype(np.float32)
+        hist /= (hist.sum() + 1e-6)
+        feats.append(hist)
+    return np.concatenate(feats)
+
+def get_gabor_features(img):
+    img  = cv2.resize(img, (128, 128))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    features = []
+    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+        for freq in [0.1, 0.25, 0.4]:
+            kernel   = cv2.getGaborKernel((21,21), 4.0, theta, 1.0/freq, 0.5, 0)
+            filtered = cv2.filter2D(gray, cv2.CV_32F, kernel)
+            features.extend([filtered.mean(), filtered.std()])
+    return np.array(features, dtype=np.float32)
+
+class HybridFeatureExtractor:
+    def __init__(self):
+        print("Loading EfficientNet-B3...")
+        self.deep = DeepFeatureExtractor()
+
+    def extract(self, img_bgr):
+        def l2(x): return x / (np.linalg.norm(x) + 1e-6)
+        deep_feat  = self.deep.extract(img_bgr)
+        deep_feat  = l2(deep_feat)
+        hog_feat   = l2(get_hog_features(img_bgr))
+        color_feat = l2(get_color_histogram(img_bgr))
+        lbp_feat   = l2(get_lbp_features(img_bgr))
+        gabor_feat = l2(get_gabor_features(img_bgr))
+        return np.concatenate([deep_feat, hog_feat, color_feat, lbp_feat, gabor_feat])
+
+# ── Initialize ──
+extractor = HybridFeatureExtractor()
+
+def predict_frame(img_bgr):
+    feat  = extractor.extract(img_bgr)
+    feat  = scaler.transform([feat])
+    feat  = pca.transform(feat)
+    proba = svm.predict_proba(feat)[0]
+    conf  = proba.max()
+    if conf < CONFIDENCE_THRESHOLD:
+        return 'unknown', conf
+    return CLASS_NAMES[proba.argmax()], conf
+
+# ── Camera loop ──
+def run():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    print("Camera running — press Q to quit")
+
+    frame_count  = 0
+    last_label   = 'unknown'
+    last_conf    = 0.0
+    PREDICT_EVERY = 5
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        if frame_count % PREDICT_EVERY == 0:
+            h, w   = frame.shape[:2]
+            size   = min(h, w)
+            cx, cy = w//2, h//2
+            crop   = frame[cy-size//2:cy+size//2, cx-size//2:cx+size//2]
+            last_label, last_conf = predict_frame(crop)
+
+        # Draw UI
+        color = CLASS_COLORS[last_label]
+        h, w  = frame.shape[:2]
+        size  = min(h, w) - 40
+        cx, cy = w//2, h//2
+
+        # Guide box
+        cv2.rectangle(frame,
+                      (cx-size//2, cy-size//2),
+                      (cx+size//2, cy+size//2),
+                      color, 2)
+
+        # Label
+        text = f"{last_label.upper()}  {last_conf*100:.1f}%"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        cv2.rectangle(frame, (cx-tw//2-10, 15), (cx+tw//2+10, 15+th+16), color, -1)
+        cv2.putText(frame, text, (cx-tw//2, 15+th+6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+
+        cv2.putText(frame, "Press Q to quit", (10, h-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+
+        cv2.imshow('Material Stream Identifier', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+run()
